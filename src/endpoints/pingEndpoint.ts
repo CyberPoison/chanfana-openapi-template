@@ -63,6 +63,22 @@ export class PingEndpoint extends OpenAPIRoute {
 
     let ipAddress: string | null = null;
 
+    // First, try to resolve the IP address using DNS API
+    try {
+      const dnsResponse = await fetch(`https://1.1.1.1/dns-query?name=${target}&type=A`, {
+        headers: { 'Accept': 'application/dns-json' }
+      });
+      if (dnsResponse.ok) {
+        const dnsData = await dnsResponse.json() as any;
+        if (dnsData.Answer && dnsData.Answer.length > 0) {
+          ipAddress = dnsData.Answer[0].data;
+        }
+      }
+    } catch (error) {
+      // If DNS lookup fails, continue without IP
+      console.log("DNS lookup failed:", error);
+    }
+
     // Perform multiple ping attempts
     for (let i = 0; i < samples; i++) {
       const attempt = i + 1;
@@ -77,18 +93,13 @@ export class PingEndpoint extends OpenAPIRoute {
         const endTime = Date.now();
         const latency = endTime - startTime;
 
-        // Try to get IP from response headers if available
-        if (!ipAddress) {
-          // Cloudflare Workers don't expose the resolved IP directly,
-          // but we can note the CF-Connecting-IP or similar headers
-          ipAddress = response.headers.get("CF-Connecting-IP") || 
-                     response.headers.get("X-Real-IP") || 
-                     "N/A (resolved by Cloudflare)";
-        }
+        // For ping purposes, any response (including 404) means the server is reachable
+        // Only network errors should be considered failures
+        const isSuccess = true; // Server responded
 
         results.push({
           attempt,
-          success: response.ok,
+          success: isSuccess,
           latency,
           statusCode: response.status,
           error: null,
@@ -110,6 +121,11 @@ export class PingEndpoint extends OpenAPIRoute {
       if (i < samples - 1) {
         await new Promise(resolve => setTimeout(resolve, 100));
       }
+    }
+    
+    // Fallback IP if DNS lookup failed
+    if (!ipAddress) {
+      ipAddress = "N/A (resolved by Cloudflare)";
     }
 
     // Calculate metrics
