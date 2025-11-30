@@ -5,20 +5,21 @@ import { z } from "zod";
 export class PingEndpoint extends OpenAPIRoute {
   public schema = {
     tags: ["Network"],
-    summary: "Ping dev.opendrive.com and return network metrics",
+    summary: "Fetch OAuth2.json from dev.opendrive.com and measure response times",
     operationId: "ping-opendrive",
     request: {
       query: z.object({
-        samples: z.string().optional().default("5").describe("Number of ping samples to collect (1-10)"),
+        samples: z.string().optional().default("5").describe("Number of samples to collect (1-10)"),
       }),
     },
     responses: {
       "200": {
-        description: "Returns network metrics including latency, IP, jitter, etc.",
+        description: "Returns network metrics including latency, IP, jitter, response size, etc.",
         ...contentJson({
           success: z.boolean(),
           result: z.object({
             target: z.string(),
+            url: z.string(),
             ip: z.string().nullable(),
             timestamp: z.string(),
             metrics: z.object({
@@ -28,6 +29,7 @@ export class PingEndpoint extends OpenAPIRoute {
               avgLatency: z.number().describe("Average latency in ms"),
               jitter: z.number().describe("Jitter (standard deviation) in ms"),
               packetLoss: z.number().describe("Packet loss percentage"),
+              avgResponseSize: z.number().describe("Average response size in bytes"),
             }),
             individualResults: z.array(
               z.object({
@@ -35,6 +37,7 @@ export class PingEndpoint extends OpenAPIRoute {
                 success: z.boolean(),
                 latency: z.number().nullable(),
                 statusCode: z.number().nullable(),
+                responseSize: z.number().nullable().describe("Response size in bytes"),
                 error: z.string().nullable(),
               })
             ),
@@ -47,7 +50,7 @@ export class PingEndpoint extends OpenAPIRoute {
   public async handle(c: AppContext) {
     const data = await this.getValidatedData<typeof this.schema>();
     const target = "dev.opendrive.com";
-    const url = `https://${target}`;
+    const url = `https://${target}/api/resources/oauth2.json`;
     
     // Parse and validate samples parameter
     let samples = parseInt(data.query.samples || "5");
@@ -58,6 +61,7 @@ export class PingEndpoint extends OpenAPIRoute {
       success: boolean;
       latency: number | null;
       statusCode: number | null;
+      responseSize: number | null;
       error: string | null;
     }> = [];
 
@@ -79,30 +83,32 @@ export class PingEndpoint extends OpenAPIRoute {
       console.log("DNS lookup failed:", error);
     }
 
-    // Perform multiple ping attempts
+    // Perform multiple GET requests to fetch the JSON
     for (let i = 0; i < samples; i++) {
       const attempt = i + 1;
       const startTime = Date.now();
       
       try {
         const response = await fetch(url, {
-          method: "HEAD",
+          method: "GET",
           signal: AbortSignal.timeout(10000), // 10 second timeout
         });
         
+        const responseText = await response.text();
         const endTime = Date.now();
         const latency = endTime - startTime;
+        const responseSize = new TextEncoder().encode(responseText).length;
 
-        // For ping purposes, any response (including 404) means the server is reachable
-        // Only network errors should be considered failures
-        const isSuccess = true; // Server responded
+        // Success means we got a 2xx response and could fetch the content
+        const isSuccess = response.ok;
 
         results.push({
           attempt,
           success: isSuccess,
           latency,
           statusCode: response.status,
-          error: null,
+          responseSize,
+          error: isSuccess ? null : `HTTP ${response.status}: ${response.statusText}`,
         });
       } catch (error) {
         const endTime = Date.now();
@@ -113,6 +119,7 @@ export class PingEndpoint extends OpenAPIRoute {
           success: false,
           latency,
           statusCode: null,
+          responseSize: null,
           error: error instanceof Error ? error.message : "Unknown error",
         });
       }
@@ -150,10 +157,19 @@ export class PingEndpoint extends OpenAPIRoute {
     // Calculate packet loss
     const packetLoss = ((samples - successfulResults.length) / samples) * 100;
 
+    // Calculate average response size
+    const responseSizes = successfulResults
+      .map(r => r.responseSize)
+      .filter((size): size is number => size !== null);
+    const avgResponseSize = responseSizes.length > 0
+      ? responseSizes.reduce((a, b) => a + b, 0) / responseSizes.length
+      : 0;
+
     return {
       success: true,
       result: {
         target,
+        url,
         ip: ipAddress,
         timestamp: new Date().toISOString(),
         metrics: {
@@ -163,6 +179,7 @@ export class PingEndpoint extends OpenAPIRoute {
           avgLatency: parseFloat(avgLatency.toFixed(2)),
           jitter: parseFloat(jitter.toFixed(2)),
           packetLoss: parseFloat(packetLoss.toFixed(2)),
+          avgResponseSize: Math.round(avgResponseSize),
         },
         individualResults: results,
       },
