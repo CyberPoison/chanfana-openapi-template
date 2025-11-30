@@ -22,11 +22,16 @@ export class PingEndpoint extends OpenAPIRoute {
             url: z.string(),
             ip: z.string().nullable(),
             timestamp: z.string(),
+            measurementPoint: z.object({
+              description: z.string(),
+              cloudflareDatacenter: z.string().nullable(),
+              workerLocation: z.string().nullable(),
+            }).describe("Information about where the latency is measured from"),
             metrics: z.object({
               samples: z.number(),
-              minLatency: z.number().describe("Minimum latency in ms"),
-              maxLatency: z.number().describe("Maximum latency in ms"),
-              avgLatency: z.number().describe("Average latency in ms"),
+              minLatency: z.number().describe("Minimum latency in ms (from worker to target)"),
+              maxLatency: z.number().describe("Maximum latency in ms (from worker to target)"),
+              avgLatency: z.number().describe("Average latency in ms (from worker to target)"),
               jitter: z.number().describe("Jitter (standard deviation) in ms"),
               packetLoss: z.number().describe("Packet loss percentage"),
               avgResponseSize: z.number().describe("Average response size in bytes"),
@@ -35,7 +40,7 @@ export class PingEndpoint extends OpenAPIRoute {
               z.object({
                 attempt: z.number(),
                 success: z.boolean(),
-                latency: z.number().nullable(),
+                latency: z.number().nullable().describe("Time from worker to target in ms"),
                 statusCode: z.number().nullable(),
                 responseSize: z.number().nullable().describe("Response size in bytes"),
                 error: z.string().nullable(),
@@ -55,6 +60,14 @@ export class PingEndpoint extends OpenAPIRoute {
     // Parse and validate samples parameter
     let samples = parseInt(data.query.samples || "5");
     samples = Math.min(Math.max(samples, 1), 10); // Clamp between 1 and 10
+
+    // Get Cloudflare Worker location information
+    // This proves the latency is measured from the worker, not from the client
+    const cfDatacenter = c.req.raw.cf?.colo as string || null;
+    const cfCountry = c.req.raw.cf?.country as string || null;
+    const cfCity = c.req.raw.cf?.city as string || null;
+    
+    const workerLocation = [cfCity, cfCountry].filter(Boolean).join(", ") || null;
 
     const results: Array<{
       attempt: number;
@@ -84,18 +97,28 @@ export class PingEndpoint extends OpenAPIRoute {
     }
 
     // Perform multiple GET requests to fetch the JSON
+    // IMPORTANT: All timing measurements happen INSIDE the Cloudflare Worker
+    // This measures latency from Worker -> dev.opendrive.com, NOT Client -> Worker -> dev.opendrive.com
     for (let i = 0; i < samples; i++) {
       const attempt = i + 1;
+      
+      // START TIMER: This happens on the Cloudflare Worker server
       const startTime = Date.now();
       
       try {
+        // This fetch request is made FROM the Cloudflare Worker TO dev.opendrive.com
         const response = await fetch(url, {
           method: "GET",
           signal: AbortSignal.timeout(10000), // 10 second timeout
         });
         
+        // Read the full response body
         const responseText = await response.text();
+        
+        // END TIMER: Still on the Cloudflare Worker server
         const endTime = Date.now();
+        
+        // Calculate latency: This is purely Worker -> Target latency
         const latency = endTime - startTime;
         const responseSize = new TextEncoder().encode(responseText).length;
 
@@ -172,6 +195,11 @@ export class PingEndpoint extends OpenAPIRoute {
         url,
         ip: ipAddress,
         timestamp: new Date().toISOString(),
+        measurementPoint: {
+          description: "Latency measured from Cloudflare Worker to target (not from client to worker)",
+          cloudflareDatacenter: cfDatacenter,
+          workerLocation: workerLocation,
+        },
         metrics: {
           samples,
           minLatency: parseFloat(minLatency.toFixed(2)),
